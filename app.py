@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Set up API keys and tokens
-openai.api_key = os.getenv("OPENAI_API_KEY")
+client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 slack_token = os.getenv("SLACK_BOT_TOKEN")
 signing_secret = os.getenv("SLACK_SIGNING_SECRET")
 
@@ -59,11 +59,17 @@ def slack_events():
         else:
             # Fallback to GPT
             try:
-                completion = openai.ChatCompletion.create(
-                    model="gpt-3.5-turbo",
-                    messages=[{"role": "user", "content": user_text}]
-                )
-                response_text = completion.choices[0].message["content"]
+                import openai
+
+client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+chat_response = client.chat.completions.create(
+    model="gpt-3.5-turbo",
+    messages=[
+        {"role": "user", "content": user_text}
+    ]
+)
+response_text = chat_response.choices[0].message.content
             except Exception as e:
                 response_text = f"Sorry, I had an issue: {str(e)}"
 
