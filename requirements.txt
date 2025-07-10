@@ -1,0 +1,4 @@
+openai
+flask
+slack_bolt
+python-dotenv
