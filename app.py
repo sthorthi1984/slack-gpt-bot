@@ -1,21 +1,21 @@
 import os
-import openai
 from flask import Flask, request, jsonify
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from slack_sdk.signature import SignatureVerifier
 from difflib import get_close_matches
 from dotenv import load_dotenv
+import openai
 
 # Load environment variables from .env file
 load_dotenv()
 
 # Set up API keys and tokens
-client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 slack_token = os.getenv("SLACK_BOT_TOKEN")
 signing_secret = os.getenv("SLACK_SIGNING_SECRET")
 
-client = WebClient(token=slack_token)
+slack_client = WebClient(token=slack_token)
 signature_verifier = SignatureVerifier(signing_secret)
 
 # Define your custom Q&A
@@ -42,12 +42,14 @@ def slack_events():
 
     payload = request.json
     print("Full payload received from Slack:", payload)
+
     # Handle Slack's URL verification challenge
     if payload.get("type") == "url_verification":
         return jsonify({"challenge": payload["challenge"]})
 
     event = payload.get("event", {})
     print("Incoming event from Slack:", event)
+
     if event.get("type") == "message" and "bot_id" not in event:
         user_text = event.get("text", "").lower()
         print("User message received:", user_text)
@@ -59,23 +61,17 @@ def slack_events():
         else:
             # Fallback to GPT
             try:
-                import openai
-
-client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-chat_response = client.chat.completions.create(
-    model="gpt-3.5-turbo",
-    messages=[
-        {"role": "user", "content": user_text}
-    ]
-)
-response_text = chat_response.choices[0].message.content
+                chat_response = openai_client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[{"role": "user", "content": user_text}]
+                )
+                response_text = chat_response.choices[0].message.content
             except Exception as e:
                 response_text = f"Sorry, I had an issue: {str(e)}"
 
         # Send reply back to Slack
         try:
-            client.chat_postMessage(
+            slack_client.chat_postMessage(
                 channel=event["channel"],
                 text=response_text
             )
