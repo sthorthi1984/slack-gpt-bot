@@ -9,7 +9,7 @@ from slack_sdk.errors import SlackApiError
 from slack_sdk.signature import SignatureVerifier
 from difflib import get_close_matches
 from dotenv import load_dotenv
-from docx import Document
+from doc import Document
 import openai
 
 # Load environment variables
