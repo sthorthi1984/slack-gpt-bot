@@ -2,3 +2,4 @@ openai
 flask
 slack_bolt
 python-dotenv
+python-docx
