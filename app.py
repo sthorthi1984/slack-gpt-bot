@@ -139,7 +139,7 @@ def render_fs_docx(fs_json):
             row[2].text = fr.get("field_name", "")
             row[3].text = fr.get("validation", "")
             row[4].text = fr.get("data_source", "")
-            row[5].text = fr.get("remarks", ""))
+            row[5].text = fr.get("remarks", "")
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
     doc.save(tmp.name)
