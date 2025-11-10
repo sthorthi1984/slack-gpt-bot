@@ -26,7 +26,7 @@ WIKI_LOOKUP_ENABLED = os.getenv("WIKI_LOOKUP_ENABLED", "true").lower() in ("1", 
 if not (OPENAI_API_KEY and SLACK_BOT_TOKEN and SLACK_SIGNING_SECRET):
     logger.warning("One or more required env vars are missing (OPENAI_API_KEY, SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET)")
 
-# OpenAI (v0.28.x)
+# OpenAI (v0.28.x pinned)
 openai.api_key = OPENAI_API_KEY
 
 # Slack client & verifier
@@ -47,9 +47,16 @@ custom_qa = {
     "what is the organization structure": "You can view the org chart in HR Portal > Org Chart."
 }
 
-# Simple in-memory dedupe for Slack event_id (process lifetime only).
+# In-memory stores (dev-friendly). Replace with Redis/DB for production.
 processed_event_ids = set()
 MAX_SEEN = 2000
+
+# Conversation history: channel_id -> list of {"role": "user"|"assistant", "content": "..."}
+conversations: dict[str, list[dict]] = {}
+# Session timestamps: channel_id -> last activity epoch
+session_timestamps: dict[str, float] = {}
+MAX_HISTORY = 10                # keep last N messages
+SESSION_TTL_SECONDS = 60 * 30   # expire sessions after 30 minutes of inactivity
 
 app = Flask(__name__)
 
@@ -108,6 +115,14 @@ def wiki_summary(query: str, max_chars=800) -> str | None:
         logger.debug("Wikipedia lookup failed: %s", e)
     return None
 
+def prune_inactive_sessions():
+    """Remove conversations older than SESSION_TTL_SECONDS to keep memory bounded."""
+    now_ts = datetime.now().timestamp()
+    to_delete = [ch for ch, ts in session_timestamps.items() if now_ts - ts > SESSION_TTL_SECONDS]
+    for ch in to_delete:
+        session_timestamps.pop(ch, None)
+        conversations.pop(ch, None)
+
 @app.route("/", methods=["GET"])
 def health():
     return "OK - Slack GPT Bot is running", 200
@@ -141,9 +156,11 @@ def slack_events():
             return make_response("", 200)
         processed_event_ids.add(event_id)
         if len(processed_event_ids) > MAX_SEEN:
-            # simple eviction to keep memory bounded
             while len(processed_event_ids) > MAX_SEEN // 2:
                 processed_event_ids.pop()
+
+    # prune old sessions at start
+    prune_inactive_sessions()
 
     event = payload.get("event", {})
     if not event:
@@ -157,7 +174,8 @@ def slack_events():
         return make_response("", 200)
 
     event_type = event.get("type")
-    channel_type = event.get("channel_type", "")  # 'im' for direct message
+    channel_type = event.get("channel_type", "")  # 'im' for direct messages
+    channel_id = event.get("channel") or event.get("channel_id") or event.get("user")
 
     # Only process:
     #  - app_mention (channel mentions)
@@ -174,27 +192,36 @@ def slack_events():
     if not cleaned_text:
         return make_response("", 200)
 
+    # Update session timestamp
+    session_timestamps[channel_id] = datetime.now().timestamp()
+
     # Local handling for date/time questions
     lc = cleaned_text.lower()
     if ("date" in lc and ("today" in lc or "current" in lc)) or (lc.strip() in ["what is today's date", "what's today's date"]):
-        today = datetime.now().strftime("%B %d, %Y")
-        response_text = f"Today's date is {today}."
+        response_text = f"Today's date is {datetime.now().strftime('%B %d, %Y')}."
     elif ("time" in lc and ("now" in lc or "current" in lc)):
-        now = datetime.now().strftime("%I:%M %p")
-        response_text = f"The current time is {now}."
+        response_text = f"The current time is {datetime.now().strftime('%I:%M %p')}."
     else:
         # 1) custom Q&A
         match = get_close_matches(cleaned_text.lower(), custom_qa.keys(), n=1, cutoff=0.65)
         if match:
             response_text = custom_qa[match[0]]
         else:
-            # 2) optional wiki lookup
+            # 2) Optional wiki lookup
             wiki_ctx = None
             if WIKI_LOOKUP_ENABLED and looks_like_search_query(cleaned_text):
                 wiki_ctx = wiki_summary(cleaned_text)
                 logger.info("Wiki context: %s", wiki_ctx)
 
-            # 3) build prompts for OpenAI
+            # 3) Use conversation history: append user message to history
+            hist = conversations.get(channel_id, [])
+            # append user role
+            hist.append({"role": "user", "content": cleaned_text})
+            # trim to last MAX_HISTORY messages
+            hist = hist[-MAX_HISTORY:]
+            conversations[channel_id] = hist
+
+            # Build system prompt including wiki context and server time
             system_prompt_lines = [
                 "You are a helpful assistant. Always be accurate and prefer saying 'I don't know' if you are not sure.",
                 f"Current date and time (server): {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
@@ -205,26 +232,35 @@ def slack_events():
                 system_prompt_lines.append(wiki_ctx)
 
             system_prompt = "\n".join(system_prompt_lines)
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": cleaned_text}
-            ]
 
+            # Build messages list: system + history (convert roles to OpenAI format)
+            messages = [{"role": "system", "content": system_prompt}]
+            # include history (user/assistant)
+            for item in hist:
+                messages.append({"role": item["role"], "content": item["content"]})
+
+            # Call OpenAI with history so model has context
             try:
                 completion = openai.ChatCompletion.create(
                     model="gpt-3.5-turbo",
                     messages=messages,
                     max_tokens=400,
                 )
-                response_text = completion.choices[0].message["content"].strip()
+                assistant_text = completion.choices[0].message["content"].strip()
+                response_text = assistant_text
+                # append assistant reply to conversation history and trim
+                conversations[channel_id].append({"role": "assistant", "content": assistant_text})
+                conversations[channel_id] = conversations[channel_id][-MAX_HISTORY:]
+                # refresh timestamp
+                session_timestamps[channel_id] = datetime.now().timestamp()
             except Exception:
                 logger.exception("OpenAI error")
                 response_text = "Sorry, I had an internal error while trying to answer."
 
     # Send reply back to Slack
     try:
-        client.chat_postMessage(channel=event["channel"], text=response_text)
-        logger.info("Replied to channel %s", event.get("channel"))
+        client.chat_postMessage(channel=channel_id, text=response_text)
+        logger.info("Replied to channel %s", channel_id)
     except SlackApiError as e:
         logger.exception("Slack API error sending message: %s", e)
 
