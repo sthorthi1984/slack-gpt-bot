@@ -47,26 +47,25 @@ custom_qa = {
     "what is the organization structure": "You can view the org chart in HR Portal > Org Chart."
 }
 
+# Simple in-memory dedupe for Slack event_id (process lifetime only).
+processed_event_ids = set()
+MAX_SEEN = 2000
+
 app = Flask(__name__)
 
 def clean_text(text: str) -> str:
-    """Remove Slack mentions like <@U12345> and return lowercased text."""
+    """Remove Slack mentions like <@U12345> and return trimmed text."""
     if not text:
         return ""
     cleaned = re.sub(r"<@[^>]+>", "", text)
     return cleaned.strip()
 
 def looks_like_search_query(text: str) -> bool:
-    """Very simple heuristic: if text contains who/what/where/when/how/define/look up or ends with '?' treat as search-ish."""
     t = text.lower()
     keywords = ["who", "what", "where", "when", "how", "define", "wiki", "latest", "news", "?"]
     return any(k in t for k in keywords)
 
 def wiki_summary(query: str, max_chars=800) -> str | None:
-    """
-    Query Wikipedia Opensearch & return a one-paragraph summary if found.
-    Returns None if no good result.
-    """
     try:
         url = "https://en.wikipedia.org/w/api.php"
         params = {
@@ -82,7 +81,6 @@ def wiki_summary(query: str, max_chars=800) -> str | None:
         if len(data) >= 4 and data[1]:
             title = data[1][0]
             page_url = data[3][0] if len(data[3]) > 0 else None
-            # fetch summary
             summary_params = {
                 "action": "query",
                 "prop": "extracts",
@@ -99,7 +97,6 @@ def wiki_summary(query: str, max_chars=800) -> str | None:
             for pid, page in pages.items():
                 extract = page.get("extract", "")
                 if extract:
-                    # return a truncated summary
                     txt = extract.strip()
                     if len(txt) > max_chars:
                         txt = txt[:max_chars].rsplit(" ", 1)[0] + "..."
@@ -136,25 +133,42 @@ def slack_events():
     if payload.get("type") == "url_verification":
         return jsonify({"challenge": payload.get("challenge")})
 
+    # Dedupe by event_id (protect against retries)
+    event_id = payload.get("event_id")
+    if event_id:
+        if event_id in processed_event_ids:
+            logger.info("Duplicate event_id %s - skipping", event_id)
+            return make_response("", 200)
+        processed_event_ids.add(event_id)
+        if len(processed_event_ids) > MAX_SEEN:
+            # simple eviction to keep memory bounded
+            while len(processed_event_ids) > MAX_SEEN // 2:
+                processed_event_ids.pop()
+
     event = payload.get("event", {})
     if not event:
         return make_response("", 200)
 
     logger.info("Event received: %s", event)
 
-    # Ignore bot messages including our own
-    if event.get("bot_id") or event.get("subtype") == "bot_message":
-        logger.debug("Ignoring bot message/event.")
+    # Ignore bot messages including our own and message edits
+    if event.get("bot_id") or event.get("subtype") in ["bot_message", "message_changed"]:
+        logger.debug("Ignoring bot or edited message/event.")
         return make_response("", 200)
 
     event_type = event.get("type")
-    # Only handle app mentions (prevents duplicate responses). Add DM handling later if desired.
-    if event_type != "app_mention":
-        logger.debug("Ignoring non-app_mention event type: %s", event_type)
+    channel_type = event.get("channel_type", "")  # 'im' for direct message
+
+    # Only process:
+    #  - app_mention (channel mentions)
+    #  - message events that are direct messages (channel_type == "im")
+    if not (event_type == "app_mention" or (event_type == "message" and channel_type == "im")):
+        logger.debug("Ignoring event type=%s channel_type=%s", event_type, channel_type)
         return make_response("", 200)
 
-    raw_text = event.get("text", "")
-    cleaned_text = clean_text(raw_text)
+    # Extract and clean user text
+    user_text = event.get("text", "")
+    cleaned_text = clean_text(user_text)
     logger.info("Cleaned user text: '%s'", cleaned_text)
 
     if not cleaned_text:
@@ -162,25 +176,25 @@ def slack_events():
 
     # Local handling for date/time questions
     lc = cleaned_text.lower()
-    if ("date" in lc and ("today" in lc or "current" in lc)) or (lc.strip() == "what is today's date" or "what's today's date" in lc):
+    if ("date" in lc and ("today" in lc or "current" in lc)) or (lc.strip() in ["what is today's date", "what's today's date"]):
         today = datetime.now().strftime("%B %d, %Y")
         response_text = f"Today's date is {today}."
     elif ("time" in lc and ("now" in lc or "current" in lc)):
         now = datetime.now().strftime("%I:%M %p")
         response_text = f"The current time is {now}."
     else:
-        # 1) Check custom Q&A (exact/fuzzy)
+        # 1) custom Q&A
         match = get_close_matches(cleaned_text.lower(), custom_qa.keys(), n=1, cutoff=0.65)
         if match:
             response_text = custom_qa[match[0]]
         else:
-            # 2) Try quick wiki lookup for fact-like queries if enabled
+            # 2) optional wiki lookup
             wiki_ctx = None
             if WIKI_LOOKUP_ENABLED and looks_like_search_query(cleaned_text):
                 wiki_ctx = wiki_summary(cleaned_text)
                 logger.info("Wiki context: %s", wiki_ctx)
 
-            # 3) Build system + user messages for OpenAI to reduce hallucination and include current datetime and wiki context
+            # 3) build prompts for OpenAI
             system_prompt_lines = [
                 "You are a helpful assistant. Always be accurate and prefer saying 'I don't know' if you are not sure.",
                 f"Current date and time (server): {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
@@ -191,13 +205,11 @@ def slack_events():
                 system_prompt_lines.append(wiki_ctx)
 
             system_prompt = "\n".join(system_prompt_lines)
-
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": cleaned_text}
             ]
 
-            # Call OpenAI (v0.28 ChatCompletion)
             try:
                 completion = openai.ChatCompletion.create(
                     model="gpt-3.5-turbo",
@@ -205,7 +217,7 @@ def slack_events():
                     max_tokens=400,
                 )
                 response_text = completion.choices[0].message["content"].strip()
-            except Exception as e:
+            except Exception:
                 logger.exception("OpenAI error")
                 response_text = "Sorry, I had an internal error while trying to answer."
 
