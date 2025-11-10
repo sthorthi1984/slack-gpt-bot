@@ -26,7 +26,13 @@ custom_qa = {
     "what is the leave policy": "Avertra provides 12 sick and 12 casual leaves annually.",
     "who do i contact for it issues": "Please email it.support@avertra.com or message #it-helpdesk.",
     "what is avertra’s vision": "“Simplify Utility Innovation” is Avertra’s long-term vision.",
-    # ... rest omitted for brevity
+    "how do i request an id card re-issue": "Use the ID Card Form from the HR Portal or type `id card` here.",
+    "where can i find the holiday calendar": "Visit SharePoint > HR Documents > Holiday Calendar 2025.",
+    "who is the head of sap department": "The SAP department head is Mr. Khurram Siddique.",
+    "how do i claim medical reimbursement": "Use the form on Intranet > Finance > Claims → Upload bills.",
+    "what is the company dress code": "Smart casuals on weekdays, formals on Mondays.",
+    "how do i get access to sap dev system": "Raise a request at sapaccess@avertra.com with your manager in CC.",
+    "what is the organization structure": "You can view the org chart in HR Portal > Org Chart."
 }
 
 app = Flask(__name__)
